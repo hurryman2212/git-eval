@@ -1,0 +1,471 @@
+#!/usr/bin/python3
+
+import argparse, sys, json, ast, requests, os, shutil, subprocess, time, csv
+from os.path import abspath
+from urllib.parse import urlparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument(
+    "FILE",
+    type=str,
+    help="*.json file",
+)
+parser.add_argument(
+    "-a",
+    "--alternate",
+    type=str,
+    metavar="KEY:VALUE",
+    nargs="+",
+    help="input JSON parameter(s) to alternate",
+)
+parser.add_argument(
+    "-c",
+    "--cache-dir",
+    type=str,
+    default=".",
+    help="cache directory",
+)
+parser.add_argument(
+    "-d",
+    "--date-format",
+    type=str,
+    default="format-local:'%Y-%m-%d %H:%M:%S'",
+    help="git-specific date format to use in output",
+)
+exclusive_group = parser.add_mutually_exclusive_group()
+exclusive_group.add_argument(
+    "-f",
+    "--force",
+    action="store_true",
+    default=False,
+    help="force `git clone` even if already cached",
+)
+reset_command = "git reset --hard && git clean -xdf"
+exclusive_group.add_argument(
+    "-r",
+    "--reset",
+    action="store_true",
+    default=False,
+    help="execute `{0}` in each repository".format(reset_command),
+)
+exclusive_group.add_argument(
+    "-u",
+    "--update",
+    action="store_true",
+    default=False,
+    help="sync each cached repositories with its remote (implies -r)",
+)
+parser.add_argument(
+    "-n",
+    "--no-concurrency",
+    action="store_true",
+    default=False,
+    help="disable concurrency for internal commands",
+)
+parser.add_argument(
+    "-o",
+    "--output",
+    type=str,
+    default="{0}.csv".format(os.path.basename(sys.argv[0])),
+    help="path to output CSV file",
+)
+parser.add_argument(
+    "-q",
+    "--quiet",
+    action="store_true",
+    default=False,
+    help="suppress internal messages",
+)
+parser.add_argument(
+    "-s",
+    "--use-ssh",
+    action="store_true",
+    default=False,
+    help="use SSH to clone repositories",
+)
+parser.add_argument(
+    "-t",
+    "--template",
+    type=str,
+    help="template CSV file to use",
+)
+parser.add_argument(
+    "-v",
+    "--verify-input-format",
+    action="store_true",
+    default=False,
+    help="(*unused*) verify input JSON format",
+)
+exclusive_group2 = parser.add_mutually_exclusive_group()
+exclusive_group2.add_argument(
+    "--skip-prepare-commands",
+    action="store_true",
+    default=False,
+    help="skip prepare commands",
+)
+exclusive_group2.add_argument(
+    "--skip-tasks",
+    action="store_true",
+    default=False,
+    help="skip tasks (implies --skip-prepare-commands)",
+)
+exclusive_group2.add_argument(
+    "--skip-rule-check",
+    action="store_true",
+    default=False,
+    help="skip rule check (implies --skip-tasks and --skip-prepare-commands)",
+)
+args = parser.parse_args()
+
+do_reset = args.reset
+do_update = args.update
+if do_update:
+    do_reset = True
+purge_cache = args.force
+if purge_cache:
+    do_update = False
+    do_reset = False
+
+skip_prepare_commands = args.skip_prepare_commands
+skip_tasks = args.skip_tasks
+if skip_tasks:
+    skip_prepare_commands = True
+skip_rule_check = args.skip_rule_check
+if skip_rule_check:
+    skip_tasks = True
+    skip_prepare_commands = True
+
+# Functions
+
+
+def oauth2_git_url(api: str, url: str, access_token: str) -> str:
+    url_parse = urlparse(url)
+    args = [access_token, url_parse.netloc, url_parse.path]
+    fmt = "https://{0}{{0}}@{{1}}{{2}}"
+    if api == "gitlab-v4":
+        fmt = fmt.format("oauth2:")
+    else:
+        fmt = fmt.format("")
+    return fmt.format(*args)
+
+
+def parse_gdict(gdict, key: str, default=None):
+    if key in gdict:
+        return gdict[key]
+    return default
+
+
+def parse_json(json_dict: json, key: str, default=None):
+    return parse_gdict(json_dict, key, default)
+
+
+quiet = args.quiet
+
+
+def log(message: str, name: str = None) -> None:
+    global quiet
+    if not quiet:
+        if name:
+            message = "[{0}] {1}".format(name, message)
+        print(
+            message,
+            file=sys.stderr,
+        )
+
+
+def run_command(
+    command: str, target: str = None, background: bool = False, **kwargs
+) -> subprocess:
+    if parse_gdict(kwargs, "shell"):
+        message = "/bin/sh {0}".format(command)
+        args = command
+    else:
+        message = command
+        args = command.split()
+    if background:
+        log("{0} &".format(message), target)
+        proc = subprocess.Popen(args, **kwargs)
+    else:
+        log(message, target)
+        proc = subprocess.run(args, **kwargs)
+    return proc
+
+
+no_internal_background = args.no_concurrency
+
+
+def run_internal_command(
+    command: str, target: str = None, background: bool = False, **kwargs
+) -> subprocess:
+    if no_internal_background:
+        background = False
+    if not parse_gdict(kwargs, "capture_output"):
+        kwargs = dict(
+            kwargs,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    return run_command(command, target, background, **kwargs)
+
+
+def run_user_command(
+    command: str, target: str = None, background: bool = False, **kwargs
+) -> subprocess:
+    if "shell" not in kwargs:
+        kwargs = dict(
+            kwargs,
+            shell=True,
+        )
+    return run_command(command, target, background, **kwargs)
+
+
+# Get list of all forks then sort it
+
+with open(args.FILE, "r") as file:
+    json_args = json.load(file)
+if args.alternate:
+    for alternate in args.alternate:
+        split = alternate.split(":")
+        key = split[0]
+        value = split[1]
+        json_args[key] = ast.literal_eval(value)
+web_url = json_args["url"]
+api_access_token = parse_json(json_args, "api_access_token", json_args["access_token"])
+repo_access_token = parse_json(
+    json_args, "repo_access_token", json_args["access_token"]
+)
+api = json_args["api"]
+supported_api = ["gitlab-v4"]
+assert api in supported_api
+use_ssh = args.use_ssh
+repos = {}
+if api == "gitlab-v4":
+    url_parse = urlparse(web_url)
+    api_url = "{0}://{1}/api/v4/".format(url_parse.scheme, url_parse.netloc)
+    headers = {"Authorization": "Bearer {0}".format(api_access_token)}
+    params = {
+        "search": url_parse.path[1:],
+        "search_namespaces": True,
+    }
+    response = requests.get(
+        "{0}projects".format(api_url), headers=headers, params=params
+    )
+    data = response.json()
+    assert len(data) == 1
+
+    orig = data[0]
+    orig_name = orig["namespace"]["path"]
+    if use_ssh:
+        orig_url = orig["ssh_url_to_repo"]
+    else:
+        orig_url = oauth2_git_url(api, orig["http_url_to_repo"], repo_access_token)
+    repos[orig_name] = orig_url
+
+    orig_id = orig["id"]
+    params = {
+        "per_page": 100,
+        "page": 1,
+    }
+    while 1:
+        response = requests.get(
+            "{0}projects/{1}/forks".format(api_url, orig_id),
+            headers=headers,
+            params=params,
+        )
+        forks = response.json()
+        nr_entry = len(forks)
+
+        for fork in forks:
+            fork_name = fork["namespace"]["path"]
+            if use_ssh:
+                fork_url = fork["ssh_url_to_repo"]
+            else:
+                fork_url = oauth2_git_url(
+                    api, fork["http_url_to_repo"], repo_access_token
+                )
+            repos[fork_name] = fork_url
+
+        if nr_entry < params["per_page"]:
+            break
+        params["page"] = params["page"] + 1
+repos = dict(sorted(repos.items()))
+
+# Save directory paths
+
+cwd_path = Path.cwd()
+cache_path = abspath(args.cache_dir)
+
+# Clone (or update) all (cached) repositories in parallel
+
+os.makedirs(
+    cache_path,
+    exist_ok=True,
+)
+proc_list = []
+os.chdir(cache_path)
+for name, repo_url in repos.items():
+    if os.path.exists(name):
+        if purge_cache:
+            shutil.rmtree(name)
+        else:
+            if do_update:
+                proc_list.append(
+                    run_internal_command(
+                        "git --git-dir {0} fetch origin -tf".format(name),
+                        background=True,
+                    )
+                )
+            continue
+    proc_list.append(
+        run_internal_command(
+            "git clone {0} {1}".format(repo_url, name),
+            background=True,
+        )
+    )
+for proc in proc_list:
+    assert proc.wait() == 0
+
+# Checkout one of given tags (+ reset & clean it) and do all prepare commands
+
+ranked_allowed_tags = parse_json(json_args, "ranked_allowed_tags", [])
+date_format = args.date_format
+prepare_commands = parse_json(json_args, "prepare_commands", [])
+out_fields = ["name", "tag", "date"]
+out = {}
+for name, repo_url in repos.items():
+    os.chdir(cache_path + "/" + name)
+
+    try:
+        repo_tag_list = run_internal_command(
+            "git --no-pager tag",
+            name,
+            capture_output=True,
+            text=True,
+        ).stdout[:-1]
+    except:
+        repo_tag_list = []
+    checkout_tag = None
+    for tag in ranked_allowed_tags:
+        if tag in repo_tag_list:
+            run_internal_command(
+                "git checkout {0}".format(tag),
+                name,
+                check=True,
+            )
+            checkout_tag = tag
+            break
+    if checkout_tag is None:
+        checkout_tag = run_internal_command(
+            "git rev-parse --abbrev-ref HEAD",
+            name,
+            capture_output=True,
+            text=True,
+        ).stdout[:-1]
+
+    if do_reset:
+        run_internal_command(
+            reset_command,
+            name,
+            check=True,
+        )
+
+    date = run_internal_command(
+        "git --no-pager log -1 --pretty='%ad' --date={0}".format(date_format),
+        name,
+        capture_output=True,
+        text=True,
+        shell=True,
+    ).stdout[:-1]
+
+    if not skip_prepare_commands:
+        for prepare_command in prepare_commands:
+            run_user_command(prepare_command, name)
+
+    out_dict = {}
+    out_dict["tag"] = checkout_tag
+    out_dict["date"] = date
+    out[name] = out_dict
+
+# Run all tasks
+
+seq_tasks = parse_json(json_args, "seq_tasks", [])
+if not skip_tasks:
+    for name, repo_url in repos.items():
+        os.chdir(cache_path + "/" + name)
+
+        for task in seq_tasks:
+            delay = parse_gdict(task, "delay")
+            if delay:
+                time.sleep(delay)
+            proc_list = []
+            commands = parse_gdict(task, "commands")
+            if commands:
+                background = parse_gdict(task, "background")
+                for command in commands:
+                    if background:
+                        proc_list.append(run_user_command(command, name, True))
+                    else:
+                        run_user_command(command, name)
+        for proc in proc_list:
+            proc.wait()
+
+# Run all rule checkings
+
+rules = parse_json(json_args, "rules", [])
+if not skip_rule_check:
+    for rule_name, rule in rules.items():
+        for criteria_name, criteria in rule.items():
+            criteria_field = "{0}-{1}".format(rule_name, criteria_name)
+            out_fields.append(criteria_field)
+
+            for name, repo_url in repos.items():
+                os.chdir(cache_path + "/" + name)
+
+                checks = criteria["checks"]
+                weight = criteria["weight"]
+                for check in checks:
+                    command = check["command"]
+                    expect = check["stdout"]
+                    real = run_user_command(
+                        command,
+                        name,
+                        capture_output=True,
+                        text=True,
+                    ).stdout[:-1]
+                    print("expect: " + expect)
+                    print("real: " + real)
+                    if real != expect:
+                        weight = 0.0
+                        break
+                out[name][criteria_field] = weight
+
+# Output CSV file to STDERR
+
+os.chdir(cwd_path)
+template_csv = args.template
+extra_rows = []
+if template_csv:
+    with open(template_csv, "r") as file:
+        reader = csv.DictReader(file)
+        template_fields = reader.fieldnames
+        rows_dict = list(reader)
+    template_out = {}
+    for template_field in template_fields:
+        if template_field not in out_fields:
+            out_fields.append(template_field)
+    for row_dict in rows_dict:
+        if "name" in row_dict:
+            template_out[row_dict["name"]] = {}
+        else:
+            extra_rows.append(row_dict)
+    out = template_out | out
+output_csv = args.output
+with open(output_csv, "w") as file:
+    writer = csv.DictWriter(file, out_fields)
+    writer.writeheader()
+    for key, value in out.items():
+        writer.writerow(dict({"name": key} | value))
+    writer.writerows(extra_rows)
