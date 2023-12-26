@@ -425,8 +425,14 @@ if not skip_rule_check:
                 os.chdir(cache_path + "/" + name)
 
                 checks = criteria["checks"]
-                weight = criteria["weight"]
+                weight = parse_gdict(criteria, "weight", 1.0)
+                allow_partial_weight = parse_gdict(
+                    criteria, "partial_weights_allowed", False
+                )
+                total_partial_weights = gained_partial_weights = 0.0
                 for check in checks:
+                    partial_weight = parse_gdict(check, "partial_weight", 1.0)
+                    total_partial_weights += partial_weight
                     command = check["command"]
                     expect = check["stdout"]
                     real = run_user_command(
@@ -435,12 +441,15 @@ if not skip_rule_check:
                         capture_output=True,
                         text=True,
                     ).stdout[:-1]
-                    print("expect: " + expect)
-                    print("real: " + real)
                     if real != expect:
-                        weight = 0.0
-                        break
-                out[name][criteria_field] = weight
+                        if not allow_partial_weight:
+                            gained_partial_weights = 0.0
+                            break
+                    else:
+                        gained_partial_weights += partial_weight
+                out[name][criteria_field] = (
+                    gained_partial_weights / total_partial_weights
+                ) * weight
 
 # Output CSV file to STDERR
 
